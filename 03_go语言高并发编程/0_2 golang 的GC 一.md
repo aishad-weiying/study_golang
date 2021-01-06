@@ -105,7 +105,13 @@ allocBits 和 gcmarkBits 的数据结构完全一致,标记结束就是内存回
 
 最终的结果就是黑色的对象会被保存下来,白色的对象被回收
 
+在go内部对象没有保存颜色的属性,三色只是对它们状态的描述
 
+- 白色的对象在它所在的span的gcmarkBits中对应的bit为0
+- 灰色的对象在它所在的span的gcmarkBits中对应的bit为1,并且对象在标记队列中
+- 黑色的对象在他虽在的span的gcmarkBits中对应的bit为1,并且对象已经从标记队列中取出并处理
+
+gc完成之后,gcmarkBits会移动到allocBits然后重新分配一个全部为0的biemap,这样黑色的对象就变为了白色
 
 ### STW(Stop To World)
 
@@ -139,6 +145,8 @@ STW 时间的长短直接影响了应用程序的执行,时间过长会导致等
 实现强/弱三色不变式的做法通常是建立读/写屏障
 
 #### 写屏障
+
+假如开始扫描的时候,发现根对象A和B,B拥有C的指针,GC先扫描A,然后B把C的指针交给了A,这样GC再扫描B,这时C就不会被扫描到了
 
 写屏障会在操作中插入指令,目的是把对数据对象的修改通知到垃圾回收器,所以写屏障通常都要有一个记录集
 
@@ -191,9 +199,11 @@ STW 的目的就是为了防止 GC 扫描内存时内存变化为停掉 goroutin
 
 
 
+
+
 ## 垃圾回收机制的触发
 
-1. 内存分配量达到阀值触发 GC 
+1. 内存分配量达到阀值触发 GC (gcTriggerHeap)
 
 每次内存分配都会检查当前内存分配量是否达到了阀值,如果达到了立即启动 GC
 
@@ -201,7 +211,7 @@ STW 的目的就是为了防止 GC 扫描内存时内存变化为停掉 goroutin
 
 内存增长率是由环境变量`GOGC`控制,默认为 100,即每次内存扩大一倍的时候启动 GC
 
-2. 定期触发 GC
+2. 定期触发 GC(gcTriggerTime)
 
 默认情况下,最长 2 分钟触发一次 GC,这个间隔在`src/runtime/proc.go:forcegcperiod`变量中被声明
 
@@ -209,6 +219,65 @@ STW 的目的就是为了防止 GC 扫描内存时内存变化为停掉 goroutin
 var forcegcperiod int64 = 2 * 60 * 1e9
 ```
 
-3. 手动触发
+3. 手动触发(gcTriggerCycle)
 
 在代码中可以使用`runtime.GC()`来手动触发 GC,这主要用于 GC 性能测试和统计
+
+
+
+触发条件的判断在gctrigger的[test](https://github.com/golang/go/blob/go1.9.2/src/runtime/mgc.go#L1154)函数.
+其中gcTriggerHeap和gcTriggerTime这两个条件是自然触发的, gcTriggerHeap的判断代码如下:
+
+```go
+return memstats.heap_live >= memstats.gc_trigger
+```
+
+heap_live的增加在上面对分配器的代码分析中可以看到,当值达到gc_trigger就会触发GC,那么gc_trigger是如何决定的呢
+
+gc_trigger的计算在[gcSetTriggerRatio](https://github.com/golang/go/blob/go1.9.2/src/runtime/mgc.go#L759)函数中, 公式是:
+
+```go
+trigger = uint64(float64(memstats.heap_marked) * (1 + triggerRatio))
+```
+
+当前标记存活的大小乘以1+系数triggerRatio, 就是下次出发GC需要的分配量.
+
+triggerRatio在每次GC后都会调整, 计算triggerRatio的函数是[encCycle](https://github.com/golang/go/blob/go1.9.2/src/runtime/mgc.go#L542), 公式是:
+
+```go
+const triggerGain = 0.5
+// 目标Heap增长率, 默认是1.0
+goalGrowthRatio := float64(gcpercent) / 100
+// 实际Heap增长率, 等于总大小/存活大小-1
+actualGrowthRatio := float64(memstats.heap_live)/float64(memstats.heap_marked) - 1
+// GC标记阶段的使用时间(因为endCycle是在Mark Termination阶段调用的)
+assistDuration := nanotime() - c.markStartTime
+// GC标记阶段的CPU占用率, 目标值是0.25
+utilization := gcGoalUtilization
+if assistDuration > 0 {
+	// assistTime是G辅助GC标记对象所使用的时间合计
+	// (nanosecnds spent in mutator assists during this cycle)
+	// 额外的CPU占用率 = 辅助GC标记对象的总时间 / (GC标记使用时间 * P的数量)
+	utilization += float64(c.assistTime) / float64(assistDuration*int64(gomaxprocs))
+}
+// 触发系数偏移值 = 目标增长率 - 原触发系数 - CPU占用率 / 目标CPU占用率 * (实际增长率 - 原触发系数)
+// 参数的分析:
+// 实际增长率越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
+// CPU占用率越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
+// 原触发系数越大, 触发系数偏移值越小, 小于0时下次触发GC会提早
+triggerError := goalGrowthRatio - memstats.triggerRatio - utilization/gcGoalUtilization*(actualGrowthRatio-memstats.triggerRatio)
+// 根据偏移值调整触发系数, 每次只调整偏移值的一半(渐进式调整)
+triggerRatio := memstats.triggerRatio + triggerGain*triggerError
+```
+
+公式中的"目标Heap增长率"可以通过设置环境变量"GOGC"调整, 默认值是100, 增加它的值可以减少GC的触发.
+设置"GOGC=off"可以彻底关掉GC.
+
+gcTriggerTime的判断代码如下:
+
+```go
+lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
+return lastgc != 0 && t.now-lastgc > forcegcperiod
+```
+
+forcegcperiod的定义是2分钟, 也就是2分钟内没有执行过GC就会强制触发.
