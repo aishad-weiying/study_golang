@@ -1,5 +1,3 @@
-
-
 ## channel 数据结构
 
 channel 是golang 在语言层次提供的goroutine间的通信方式,比Unix管道更加的易用轻便,channel主要用于进程内各个goroutine间的通信,如果需要跨进程通信,建议使用分布式系统的方法来解决
