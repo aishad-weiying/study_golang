@@ -212,8 +212,9 @@ type Context interface {
 
 其中:
 
-- Deadline() : 方法需要返回的是当前 Context 被取消的时间,也就是完成工作截止的时间 deadline
+- Deadline() : 方法需要返回的是当前 Context 被取消的时间,也就是完成工作截止的时间 deadline,如果没有设置deadline,这ok == false,此时deadline为一个初始值的time.Time值
 - Done() 方法返回的是一个 channel,这个 channel 会在当前工作完成或者上下文被取消之后关闭,多次调用 Done() 方法返回的是同一个 channel
+  - 需要在select 中使用`case <- context.Done():`,当context关闭以后,Done()返回一个被关闭的管道,关闭的管理仍然是可读的,据此goroutine可以收到关闭请求,当context还未关闭的时候,Done() 返回nil
 - Err() 方法返回的是当前 Context 关闭的原因,它只会在 Done 返回的 channel 被关闭时才会返回非空的值
   - 如果当前 Context 被主动取消就会返回 Canceled 错误
   - 如果当前 Context 因 deadline 关闭就会返回 deadline exceeded
@@ -241,11 +242,19 @@ go 内置了两个函数: `Background()`和`TODO()`,这两个函数分别返回�
 
 ```go
 func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
-    c := newCancelCtx(parent)
-    propagateCancel(parent, &c)
-    return &c, func() { c.cancel(true, Canceled) }
+    c := newCancelCtx(parent) // 初始化一个cancelCtx 实例
+    propagateCancel(parent, &c)	// 将cancelCtx实例添加到其父节点的children中(如果父节点也可以被cancel的话)
+    return &c, func() { c.cancel(true, Canceled) }// 返回cancelCtx实例和cancel方法
 }
 ```
+
+这里将自身节点添加到父节点的过程有必要简单的说一下:
+
+- 如果父节点也支持cancel,也就是说其父节点肯定有children成员,那么把新context添加到children里即可
+
+- 如果父节点不支持cancel,就继续向上查询,直到找到一个支持cancel的节点,把新context添加到children里面
+
+- 如果所有的父节点均不支持cancel,则启动一个协程等待父节点结束,然后再把当前context结束
 
 WithCancel 返回带有新 Done 通道的父节点的副本,当调用返回的 cancel 函数或当关闭父上下文的 Done 通道的时候,将关闭返回上下文的 Done 通道,无论先发生什么情况
 
@@ -333,7 +342,9 @@ func main() {
 `WithTimeout`的函数签名如下：
 
 ```go
-func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc)
+func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc) {
+	return WithDeadline(parent, time.Now().Add(timeout))
+}
 ```
 
 `WithTimeout`返回`WithDeadline(parent, time.Now().Add(timeout))`。
@@ -383,6 +394,23 @@ func main() {
 ```
 
 4. WithValue
+
+```go
+func WithValue(parent Context, key, val interface{}) Context {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
+	if key == nil {
+		panic("nil key")
+	}
+	if !reflectlite.TypeOf(key).Comparable() {
+		panic("key is not comparable")
+	}
+	return &valueCtx{parent, key, val}
+}
+```
+
+经典案例:
 
 ```go
 package main
