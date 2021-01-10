@@ -88,7 +88,7 @@ go 语言的 gc 在创建阶段,会为每个 P 创建一个 MarkWorker 协程,�
 
 在 STW 的情况下开启写屏障,等所有的准备工作做好以后,start zhe world ,所有的 P 都会知道写屏障已经开启,然后这些后台的 MarkWorker 得到调度执行,开始进行标记工作
 
-![image-20210107102658029](../image-20210107102658029.png)
+![image-20210107102658029](images/image-20210107102658029.png)
 
 当没有标记工作的时候,进行第二次的 STW,GC 进入_GCMarkTermiation 阶段
 
